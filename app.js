@@ -396,16 +396,153 @@ function initFlatDemo() {
 /* ================================================================
    FULL CNN PIPELINE (Section 1, bottom)
    ================================================================ */
-const PIPELINE_INPUT_SIZE = 5;
-const PIPELINE_KERN_SIZE = 3;
-let pipelineInputData = [];
-let pipelineKernelData = [];
+const PIPELINE_N_MAX = 14;
+const PIPELINE_K_MAX = 11;
+
+let pipelineInputData = []; // N×N
+let pipelineKernelData = []; // K×K
 let pipelineAnimRunning = false;
 let pipelineAnimAbort = false;
 let pipelinePaused = false;
 /** @type {{resolve: Function|null}|null} */
 let pipelinePauseWait = null;
-let pipelineInputCells = []; // [r][c] -> HTMLElement
+let pipelineInputCells = []; // editable [ir][ic] HTMLElement
+/** Child layout for #pipelineInputGrid (row-major, width = paddedW) */
+let pipelineGridLayout = {
+  paddedH: 5,
+  paddedW: 5,
+  padTop: 0,
+  padBot: 0,
+  padLeft: 0,
+  padRight: 0,
+  N: 5,
+  usePadUi: false,
+};
+
+function readSanitizedPipelineConfig() {
+  const nEl = document.getElementById('pipelineInputN');
+  const kEl = document.getElementById('pipelineKernelN');
+  const sEl = document.getElementById('pipelineConvStride');
+  const pkEl = document.getElementById('pipelinePoolSize');
+  const psEl = document.getElementById('pipelinePoolStride');
+  let N = parseInt(nEl?.value, 10);
+  if (!Number.isFinite(N)) N = 5;
+  N = Math.max(2, Math.min(PIPELINE_N_MAX, N));
+  if (nEl) nEl.value = String(N);
+
+  let K = parseInt(kEl?.value, 10);
+  if (!Number.isFinite(K)) K = 3;
+  K = Math.max(1, Math.min(PIPELINE_K_MAX, K));
+  if (kEl) kEl.value = String(K);
+
+  let convS = parseInt(sEl?.value, 10);
+  if (!Number.isFinite(convS)) convS = 1;
+  convS = Math.max(1, Math.min(8, convS));
+  if (sEl) sEl.value = String(convS);
+
+  let poolK = parseInt(pkEl?.value, 10);
+  if (!Number.isFinite(poolK)) poolK = 2;
+  poolK = Math.max(1, Math.min(PIPELINE_K_MAX, poolK));
+  if (pkEl) pkEl.value = String(poolK);
+
+  let poolS = parseInt(psEl?.value, 10);
+  if (!Number.isFinite(poolS)) poolS = 1;
+  poolS = Math.max(1, Math.min(8, poolS));
+  if (psEl) psEl.value = String(poolS);
+
+  return { N, K, convS, poolK, poolS };
+}
+
+function syncPipelineUILabels() {
+  const cfg = readSanitizedPipelineConfig();
+  const ih = document.getElementById('pipelineInputHeading');
+  if (ih) ih.textContent = `Input grid (${cfg.N}×${cfg.N}, 0–9)`;
+  const kh = document.getElementById('pipelineKernelHeading');
+  if (kh) kh.textContent = `Kernel (${cfg.K}×${cfg.K})`;
+  const ph = document.getElementById('pipelinePoolHeading');
+  if (ph) ph.textContent = `Pooling (${cfg.poolK}×${cfg.poolK}, stride ${cfg.poolS})`;
+}
+
+/** TensorFlow-style SAME pad along one spatial axis (square input assumed). */
+function pipelineSameAxisPad1D(inLen, Kern, stride) {
+  const outDim = Math.ceil(inLen / stride);
+  const totalPad = Math.max(0, stride * (outDim - 1) + Kern - inLen);
+  const before = Math.floor(totalPad / 2);
+  const after = totalPad - before;
+  const paddedLen = before + inLen + after;
+  return { before, after, paddedLen, outDim };
+}
+
+function resizeSquarePreserve(prev, newN, filler) {
+  const p = prev && prev.length ? prev : [];
+  return Array.from({ length: newN }, (_, r) =>
+    Array.from({ length: newN }, (_, c) => {
+      if (p[r] && p[r][c] !== undefined && !Number.isNaN(p[r][c])) return p[r][c];
+      return filler();
+    }));
+}
+
+function resizeKernelPreserve(prev, newK, filler) {
+  const p = prev && prev.length ? prev : [];
+  return Array.from({ length: newK }, (_, r) =>
+    Array.from({ length: newK }, (_, c) => {
+      if (p[r] && p[r][c] !== undefined && !Number.isNaN(p[r][c])) return p[r][c];
+      return filler();
+    }));
+}
+
+function ensurePipelineTensorSizes() {
+  const { N, K } = readSanitizedPipelineConfig();
+  if (!pipelineInputData.length || pipelineInputData.length !== N) {
+    pipelineInputData = resizeSquarePreserve(
+      pipelineInputData,
+      N,
+      () => Math.round(Math.random() * 9)
+    );
+  }
+  if (!pipelineKernelData.length || pipelineKernelData.length !== K) {
+    pipelineKernelData = resizeKernelPreserve(pipelineKernelData, K, () => 0);
+  }
+}
+
+function pipelineBuildNumericPadded(input2d, useSamePad, Kern, stride) {
+  const N = input2d.length;
+  if (!N || input2d[0].length !== N) throw new Error('square input expected');
+  if (!useSamePad) return input2d.map(rr => [...rr]);
+  const ra = pipelineSameAxisPad1D(N, Kern, stride);
+  const ca = pipelineSameAxisPad1D(N, Kern, stride);
+  const Ph = ra.paddedLen;
+  const Pw = ca.paddedLen;
+  const padTop = ra.before;
+  const padLeft = ca.before;
+  const padded = Array.from({ length: Ph }, () => Array(Pw).fill(0));
+  for (let r = 0; r < N; r++)
+    for (let c = 0; c < N; c++)
+      padded[padTop + r][padLeft + c] = input2d[r][c];
+  return padded;
+}
+
+/** Embed a 3×3 preset centrally into K×K (fallback to uniform when K&lt;3). */
+function pipelineEmbedPreset3(mat3, K) {
+  if (K < 3) {
+    const v = 1 / (K * K || 1);
+    return Array.from({ length: K }, () => Array(K).fill(v));
+  }
+  const off = Math.floor((K - 3) / 2);
+  const out = Array.from({ length: K }, () => Array(K).fill(0));
+  for (let i = 0; i < 3; i++)
+    for (let j = 0; j < 3; j++)
+      out[off + i][off + j] = mat3[i][j];
+  return out;
+}
+
+function pipelineSetDimInputsDisabled(disabled) {
+  ['pipelineInputN', 'pipelineKernelN', 'pipelineConvStride', 'pipelinePoolSize',
+    'pipelinePoolStride', 'pipelinePoolType', 'pipelinePadding'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.disabled = !!disabled;
+  });
+}
 
 function pipelineClamp01(t) {
   return Math.max(0, Math.min(1, t));
@@ -426,18 +563,21 @@ function clearPipelineConvHighlight() {
   });
 }
 
-/** Visual + index layout matches conv tensor: 5×5 (no pad) or 7×7 with border of implicit zeros. */
-function setPipelineConvHighlight(paddedOriginR, paddedOriginC, _stride, padding) {
+/** Highlight K×K window on the visible grid (N×N or SAME-padded Ph×Pw). */
+function setPipelineConvHighlight(paddedOriginR, paddedOriginC, paddingCheckbox) {
   clearPipelineConvHighlight();
   const inpDiv = document.getElementById('pipelineInputGrid');
   if (!inpDiv) return;
-  const dim = padding ? PIPELINE_INPUT_SIZE + 2 : PIPELINE_INPUT_SIZE;
-  for (let kr = 0; kr < PIPELINE_KERN_SIZE; kr++) {
-    for (let kc = 0; kc < PIPELINE_KERN_SIZE; kc++) {
+  const { paddedW, paddedH, N } = pipelineGridLayout;
+  const dimW = paddingCheckbox ? paddedW : N;
+  const dimH = paddingCheckbox ? paddedH : N;
+  const Kern = pipelineKernelData.length;
+  for (let kr = 0; kr < Kern; kr++) {
+    for (let kc = 0; kc < Kern; kc++) {
       const pr = paddedOriginR + kr;
       const pc = paddedOriginC + kc;
-      if (pr < 0 || pc < 0 || pr >= dim || pc >= dim) continue;
-      const el = inpDiv.children[pr * dim + pc];
+      if (pr < 0 || pc < 0 || pr >= dimH || pc >= dimW) continue;
+      const el = inpDiv.children[pr * dimW + pc];
       if (el) el.classList.add('pipeline-cell-conv-highlight');
     }
   }
@@ -477,18 +617,6 @@ function pipelineDeterministicDenseParams(flatVec, nNeurons) {
     b.push(parseFloat((Math.cos(seed * Math.PI * 2) * 0.25).toFixed(4)));
   }
   return { W, b };
-}
-
-/** Build padded tensor for convolution; pad = 1 when "same" ON, else 0. */
-function pipelineBuildPadded(input, padding) {
-  if (!padding) return input.map(r => [...r]);
-  const s = PIPELINE_INPUT_SIZE;
-  return Array.from({ length: s + 2 }, (_, r) =>
-    Array.from({ length: s + 2 }, (_, c) => {
-      if (r === 0 || r === s + 1 || c === 0 || c === s + 1) return 0;
-      return input[r - 1][c - 1];
-    })
-  );
 }
 
 function pipelineGridMinMax(mat) {
@@ -594,11 +722,15 @@ function pipelineDrawVectorStrip(canvas, values, revealedCount) {
 }
 
 function initFullPipelineDemo() {
-  pipelineInputData = Array.from({ length: PIPELINE_INPUT_SIZE }, () =>
-    Array.from({ length: PIPELINE_INPUT_SIZE }, () => Math.round(Math.random() * 9))
-  );
-  pipelineKernelData = [[-1, -1, -1], [-1, 8, -1], [-1, -1, -1]];
+  readSanitizedPipelineConfig();
   pipelineInputCells = [];
+  const cfg = readSanitizedPipelineConfig();
+  pipelineInputData = Array.from({ length: cfg.N }, () =>
+    Array.from({ length: cfg.N }, () => Math.round(Math.random() * 9))
+  );
+  const laplacian3 = [[-1, -1, -1], [-1, 8, -1], [-1, -1, -1]];
+  pipelineKernelData = pipelineEmbedPreset3(laplacian3.map(rr => [...rr]), cfg.K);
+  syncPipelineUILabels();
   renderPipelineGrids();
   resetPipelineAnimation();
 }
@@ -606,20 +738,50 @@ function initFullPipelineDemo() {
 function renderPipelineGrids() {
   const inpDiv = document.getElementById('pipelineInputGrid');
   if (!inpDiv) return;
+  readSanitizedPipelineConfig();
+  ensurePipelineTensorSizes();
+  syncPipelineUILabels();
+
+  const cfg = readSanitizedPipelineConfig();
+  const { N, K } = cfg;
+  const padOn = !!document.getElementById('pipelinePadding')?.checked;
+
+  let Ph, Pw, padTop, padLeft;
+  if (padOn) {
+    const ra = pipelineSameAxisPad1D(N, K, cfg.convS);
+    const ca = pipelineSameAxisPad1D(N, K, cfg.convS);
+    Ph = ra.paddedLen;
+    Pw = ca.paddedLen;
+    padTop = ra.before;
+    padLeft = ca.before;
+  } else {
+    Ph = Pw = N;
+    padTop = padLeft = 0;
+  }
+
+  pipelineGridLayout = {
+    paddedH: Ph,
+    paddedW: Pw,
+    padTop,
+    padBot: Ph - padTop - N,
+    padLeft,
+    padRight: Pw - padLeft - N,
+    N,
+    usePadUi: padOn,
+  };
+
   inpDiv.innerHTML = '';
   inpDiv.style.display = 'inline-grid';
   inpDiv.style.gap = '2px';
-  const padOn = !!document.getElementById('pipelinePadding')?.checked;
-  const gridDim = padOn ? PIPELINE_INPUT_SIZE + 2 : PIPELINE_INPUT_SIZE;
-  inpDiv.style.gridTemplateColumns = `repeat(${gridDim}, 38px)`;
+  inpDiv.style.gridTemplateColumns = `repeat(${Pw}, 38px)`;
   pipelineInputCells = [];
-  for (let r = 0; r < PIPELINE_INPUT_SIZE; r++) pipelineInputCells[r] = [];
+  for (let r = 0; r < N; r++) pipelineInputCells[r] = [];
 
   const appendZeroPadCell = () => {
     const z = document.createElement('span');
     z.className = 'pipeline-pad-zero-cell';
     z.textContent = '0';
-    z.title = 'Implicit zero (same padding — not editable)';
+    z.title = 'Implicit zero (SAME padding — not editable)';
     z.style.background = cellColor(0, 0, 9);
     z.style.color = '#eee';
     inpDiv.appendChild(z);
@@ -654,26 +816,27 @@ function renderPipelineGrids() {
   };
 
   if (padOn) {
-    const last = PIPELINE_INPUT_SIZE + 1;
-    for (let r = 0; r <= last; r++) {
-      for (let c = 0; c <= last; c++) {
-        const isBorder = (r === 0 || r === last || c === 0 || c === last);
-        if (isBorder) appendZeroPadCell();
-        else appendEditable(r - 1, c - 1);
+    for (let r = 0; r < Ph; r++) {
+      for (let c = 0; c < Pw; c++) {
+        const inCore = r >= padTop && r < padTop + N && c >= padLeft && c < padLeft + N;
+        if (inCore) appendEditable(r - padTop, c - padLeft);
+        else appendZeroPadCell();
       }
     }
   } else {
-    for (let r = 0; r < PIPELINE_INPUT_SIZE; r++) {
-      for (let c = 0; c < PIPELINE_INPUT_SIZE; c++) appendEditable(r, c);
-    }
+    for (let ir = 0; ir < N; ir++)
+      for (let ic = 0; ic < N; ic++) appendEditable(ir, ic);
   }
   syncPipelinePaddingClass();
 
+  pipelineSetDimInputsDisabled(pipelineAnimRunning && !pipelinePaused);
+
   const kernDiv = document.getElementById('pipelineKernelGrid');
+  if (!kernDiv) return;
   kernDiv.innerHTML = '';
-  kernDiv.style.gridTemplateColumns = `repeat(${PIPELINE_KERN_SIZE}, 44px)`;
-  for (let r = 0; r < PIPELINE_KERN_SIZE; r++) {
-    for (let c = 0; c < PIPELINE_KERN_SIZE; c++) {
+  kernDiv.style.gridTemplateColumns = `repeat(${K}, 44px)`;
+  for (let r = 0; r < K; r++) {
+    for (let c = 0; c < K; c++) {
       const inp = document.createElement('input');
       inp.type = 'number';
       inp.step = '0.1';
@@ -694,28 +857,42 @@ function renderPipelineGrids() {
 
 function randomizePipelineInput() {
   if (pipelineAnimRunning && !pipelinePaused) return;
-  pipelineInputData = Array.from({ length: PIPELINE_INPUT_SIZE }, () =>
-    Array.from({ length: PIPELINE_INPUT_SIZE }, () => Math.round(Math.random() * 9))
+  readSanitizedPipelineConfig();
+  const { N } = readSanitizedPipelineConfig();
+  pipelineInputData = Array.from({ length: N }, () =>
+    Array.from({ length: N }, () => Math.round(Math.random() * 9))
   );
   renderPipelineGrids();
   resetPipelineAnimation();
 }
 
 function setPipelineKernelPreset(name) {
-  const presets = {
+  const { K } = readSanitizedPipelineConfig();
+  const presets3 = {
     'edge-h':  [[-1, -1, -1], [0, 0, 0], [1, 1, 1]],
     'edge-v':  [[-1, 0, 1], [-1, 0, 1], [-1, 0, 1]],
-    'blur':    [[1 / 9, 1 / 9, 1 / 9], [1 / 9, 1 / 9, 1 / 9], [1 / 9, 1 / 9, 1 / 9]],
+    'blur': null,
     'sharpen': [[0, -1, 0], [-1, 5, -1], [0, -1, 0]],
   };
-  pipelineKernelData = presets[name].map(rr => [...rr]);
+  if (name === 'blur') {
+    const v = 1 / (K * K || 1);
+    pipelineKernelData = Array.from({ length: K }, () =>
+      Array.from({ length: K }, () => parseFloat(v.toFixed(6)))
+    );
+  } else if (presets3[name]) {
+    pipelineKernelData = pipelineEmbedPreset3(presets3[name].map(rr => [...rr]), K);
+  }
   renderPipelineGrids();
   resetPipelineAnimation();
 }
 
 function updatePipelineParams() {
+  if (pipelineAnimRunning && !pipelinePaused) return;
+  readSanitizedPipelineConfig();
+  syncPipelineUILabels();
   syncPipelinePaddingClass();
-  if (!pipelineAnimRunning) resetPipelineAnimation();
+  ensurePipelineTensorSizes();
+  resetPipelineAnimation();
 }
 
 async function pipelineDelay() {
@@ -833,24 +1010,28 @@ async function startPipelineAnimation() {
   pipelineSetPlayButtonRunning();
   renderPipelineGrids();
 
-  const stride = parseInt(document.getElementById('pipelineStride').value, 10) === 2 ? 2 : 1;
+  const cfg = readSanitizedPipelineConfig();
+  const stride = cfg.convS;
+  const poolK = cfg.poolK;
+  const poolS = cfg.poolS;
   const padding = !!document.getElementById('pipelinePadding').checked;
   const poolType = document.getElementById('pipelinePoolType').value;
   const trace = document.getElementById('pipelineCalcTrace');
 
   const input = pipelineInputData;
   const kernel = pipelineKernelData;
-  const padded = pipelineBuildPadded(input, padding);
+  const Kern = cfg.K;
+  const padded = pipelineBuildNumericPadded(input, padding, Kern, stride);
   const ph = padded.length;
   const pw = padded[0].length;
 
-  let oh = Math.floor((ph - PIPELINE_KERN_SIZE) / stride) + 1;
-  let ow = Math.floor((pw - PIPELINE_KERN_SIZE) / stride) + 1;
+  const oh = Math.floor((ph - Kern) / stride) + 1;
+  const ow = Math.floor((pw - Kern) / stride) + 1;
 
-  const edgeMsg =
-    ph < PIPELINE_KERN_SIZE || pw < PIPELINE_KERN_SIZE || oh < 1 || ow < 1;
-  if (edgeMsg) {
-    pipelineAppendTrace(trace, '—', 'Convolution output has no valid positions for this stride/padding/kernel.', '—');
+  const kernBad = kernel.length !== Kern || kernel.some(rr => rr.length !== Kern);
+  const edgeMsg = ph < Kern || pw < Kern || oh < 1 || ow < 1;
+  if (edgeMsg || kernBad) {
+    pipelineAppendTrace(trace, '—', 'Convolution output has no valid positions for this stride/padding/kernel size.', '—');
     pipelineAnimRunning = false;
     pipelineSetPlayButtonIdle();
     renderPipelineGrids();
@@ -862,7 +1043,12 @@ async function startPipelineAnimation() {
   document.getElementById('pipelineFeatureSize').textContent = `${oh}×${ow}`;
   pipelineDrawHeatNumberGrid(fCanvas, featureMap.map(r => r.map(() => 0)));
 
-  pipelineAppendTrace(trace, 'conv', `${padding ? 'same (1-pixel zero pad)' : 'no pad'}, stride=${stride}`, 'start');
+  const padDesc = padding
+    ? `SAME (${ph}×${pw} padded from ${cfg.N}×${cfg.N})`
+    : 'valid / no pad';
+  pipelineAppendTrace(trace, 'conv',
+    `${Kern}×${Kern} kernel, ${padDesc}, stride ${stride}`,
+    'start');
 
   for (let r = 0; r < oh; r++) {
     for (let c = 0; c < ow; c++) {
@@ -870,12 +1056,12 @@ async function startPipelineAnimation() {
 
       const pr0 = r * stride;
       const pc0 = c * stride;
-      setPipelineConvHighlight(pr0, pc0, stride, padding);
+      setPipelineConvHighlight(pr0, pc0, padding);
 
       let sum = 0;
       const terms = [];
-      for (let kr = 0; kr < PIPELINE_KERN_SIZE; kr++) {
-        for (let kc = 0; kc < PIPELINE_KERN_SIZE; kc++) {
+      for (let kr = 0; kr < Kern; kr++) {
+        for (let kc = 0; kc < Kern; kc++) {
           const iv = padded[pr0 + kr][pc0 + kc];
           const kv = kernel[kr][kc];
           sum += iv * kv;
@@ -902,38 +1088,43 @@ async function startPipelineAnimation() {
     return;
   }
 
-  pipelineAppendTrace(trace, 'conv', `Done. Feature map shape ${oh}×${ow}.`, `step ${stride}`);
+  pipelineAppendTrace(trace, 'conv', `Done. Feature map shape ${oh}×${ow}.`, `stride ${stride}`);
 
-  const poolPossible = oh >= 2 && ow >= 2;
+  const poolOutH = Math.floor((oh - poolK) / poolS) + 1;
+  const poolOutW = Math.floor((ow - poolK) / poolS) + 1;
+  const poolPossible =
+    oh >= poolK && ow >= poolK && poolOutH >= 1 && poolOutW >= 1;
+
   let flatVec = [];
   let pooled2d = null;
 
   const pCanvas = document.getElementById('pipelinePoolCanvas');
   if (!poolPossible) {
-    pipelineAppendTrace(trace, 'pool', `⚠ Map ${oh}×${ow} → cannot tile 2×2 non-overlapping windows. Flatten raw map.`, '—');
+    pipelineAppendTrace(trace, 'pool',
+      `⚠ Map ${oh}×${ow} cannot host ${poolK}×${poolK} windows with stride ${poolS}. Flatten raw feature map.`,
+      '—');
     for (let r = 0; r < oh; r++)
       for (let c = 0; c < ow; c++)
         flatVec.push(featureMap[r][c]);
     document.getElementById('pipelinePoolSize').textContent = '—';
-    const emptyPool = [[0]];
-    pipelineDrawHeatNumberGrid(pCanvas, emptyPool);
+    pipelineDrawHeatNumberGrid(pCanvas, [[0]]);
   } else {
-    const poolH = Math.floor(oh / 2);
-    const poolW = Math.floor(ow / 2);
-    pooled2d = Array.from({ length: poolH }, () => Array(poolW).fill(0));
+    pooled2d = Array.from({ length: poolOutH }, () => Array(poolOutW).fill(0));
     pipelineDrawHeatNumberGrid(pCanvas, pooled2d);
-    document.getElementById('pipelinePoolSize').textContent = `${poolH}×${poolW}`;
+    document.getElementById('pipelinePoolSize').textContent = `${poolOutH}×${poolOutW}`;
 
-    pipelineAppendTrace(trace, 'pool', `${poolType} pool 2×2, stride 2`, `windows ${poolH}×${poolW}`);
+    pipelineAppendTrace(trace, 'pool',
+      `${poolType} pool ${poolK}×${poolK}, stride ${poolS}`,
+      `windows ${poolOutH}×${poolOutW}`);
 
-    for (let pr = 0; pr < poolH; pr++) {
-      for (let pc = 0; pc < poolW; pc++) {
+    for (let pr = 0; pr < poolOutH; pr++) {
+      for (let pc = 0; pc < poolOutW; pc++) {
         if (!(await pipelineDelay()) || pipelineAnimAbort) break;
 
         const vals = [];
-        for (let rr = 0; rr < 2; rr++)
-          for (let cc = 0; cc < 2; cc++)
-            vals.push(featureMap[pr * 2 + rr][pc * 2 + cc]);
+        for (let rr = 0; rr < poolK; rr++)
+          for (let cc = 0; cc < poolK; cc++)
+            vals.push(featureMap[pr * poolS + rr][pc * poolS + cc]);
 
         const poolVal =
           poolType === 'max' ? Math.max(...vals) :
@@ -941,9 +1132,9 @@ async function startPipelineAnimation() {
         pooled2d[pr][pc] = poolVal;
 
         const fmShow = featureMapToNested(featureMap, oh, ow);
-        const hiR = pr * 2;
-        const hiC = pc * 2;
-        pipelineDrawHeatNumberGrid(fCanvas, fmShow, { r0: hiR, c0: hiC, h: 2, w: 2 });
+        const hiR = pr * poolS;
+        const hiC = pc * poolS;
+        pipelineDrawHeatNumberGrid(fCanvas, fmShow, { r0: hiR, c0: hiC, h: poolK, w: poolK });
         pipelineDrawHeatNumberGrid(pCanvas, pooled2d);
 
         const label = poolType === 'max' ? 'max' : 'min';
@@ -958,8 +1149,8 @@ async function startPipelineAnimation() {
     pipelineDrawHeatNumberGrid(fCanvas, featureMapToNested(featureMap, oh, ow));
 
     flatVec = [];
-    for (let r = 0; r < poolH; r++)
-      for (let c = 0; c < poolW; c++)
+    for (let r = 0; r < poolOutH; r++)
+      for (let c = 0; c < poolOutW; c++)
         flatVec.push(pooled2d[r][c]);
 
     if (pipelineAnimAbort) {
@@ -969,7 +1160,7 @@ async function startPipelineAnimation() {
       return;
     }
 
-    pipelineAppendTrace(trace, 'pool', `Done ${poolType} pooling. Flatten (${flatVec.length}).`, `${poolH}×${poolW}`);
+    pipelineAppendTrace(trace, 'pool', `Done ${poolType} pooling. Flatten (${flatVec.length}).`, `${poolOutH}×${poolOutW}`);
   }
 
   if (pipelineAnimAbort) {

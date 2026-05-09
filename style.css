@@ -1308,3 +1308,9 @@ hr.doodle {
     max-width: min(320px, 100%);
     flex: 1 1 220px;
 }
+
+.pipeline-dim-input {
+    width: 52px;
+    min-width: 44px;
+    text-align: center;
+}

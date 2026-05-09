@@ -197,16 +197,16 @@
                 <!-- ═══ FULL CNN PIPELINE (end of Section 1) ═══ -->
                 <div class="card pipeline-full-card" style="margin-top:18px;">
                     <div class="card-title"
-                        data-tip="End-to-end forward pass: convolve 5×5 input with a 3×3 kernel, pool 2×2 stride 2, flatten, then a tiny dense layer (2 neurons, ReLU). Step timing is controlled by the speed slider.">
+                        data-tip="Configurable forward pass: convolve over an N×N input with a K×K kernel (optional SAME padding), then pooling with chosen window size and stride, flatten, dense (2 neurons, ReLU). Step timing follows the speed slider.">
                         🎬 Full CNN Pipeline — Forward Pass</div>
                     <div class="row" style="align-items:flex-start; flex-wrap:wrap; gap:20px;">
                         <div class="col" style="min-width:260px;">
-                            <div class="small dim">Input Grid (5×5, 0–9)</div>
+                            <div class="small dim mono" id="pipelineInputHeading">Input grid (5×5, 0–9)</div>
                             <div id="pipelineInputGrid" class="pipeline-input-grid" role="grid"
                                 aria-label="Convolution input"></div>
                             <button class="btn btn-sm btn-secondary mt-8" type="button"
                                 onclick="randomizePipelineInput()">🎲 Random</button>
-                            <div class="small dim mt-8">Kernel (3×3)</div>
+                            <div class="small dim mono mt-8" id="pipelineKernelHeading">Kernel (K×K)</div>
                             <div id="pipelineKernelGrid" style="display:inline-grid; gap:2px;"></div>
                             <div class="row mt-8" style="gap:6px; flex-wrap:wrap;">
                                 <button class="btn btn-sm btn-secondary" type="button"
@@ -220,19 +220,39 @@
                             </div>
                         </div>
                         <div class="col" style="flex:1; min-width:340px;">
-                            <div class="row" style="gap:12px; flex-wrap:wrap;">
+                            <div class="row" style="gap:10px; flex-wrap:wrap; align-items:flex-end;">
                                 <div class="ctrl-row" style="margin-bottom:0;">
-                                    <span class="ctrl-label">Stride</span>
-                                    <select id="pipelineStride" onchange="updatePipelineParams()">
-                                        <option value="1">1</option>
-                                        <option value="2">2</option>
-                                    </select>
+                                    <label class="ctrl-label" for="pipelineInputN">Input N</label>
+                                    <input type="number" id="pipelineInputN" class="pipeline-dim-input" min="2" max="14"
+                                        value="5" step="1" onchange="updatePipelineParams()" title="Square input N×N" />
+                                </div>
+                                <div class="ctrl-row" style="margin-bottom:0;">
+                                    <label class="ctrl-label" for="pipelineKernelN">Kernel K</label>
+                                    <input type="number" id="pipelineKernelN" class="pipeline-dim-input" min="1" max="11"
+                                        value="3" step="1" onchange="updatePipelineParams()" title="Conv kernel K×K" />
+                                </div>
+                                <div class="ctrl-row" style="margin-bottom:0;">
+                                    <label class="ctrl-label" for="pipelineConvStride">Conv stride</label>
+                                    <input type="number" id="pipelineConvStride" class="pipeline-dim-input" min="1"
+                                        max="8" value="1" step="1" onchange="updatePipelineParams()" />
                                 </div>
                                 <div class="ctrl-row" style="margin-bottom:0;">
                                     <span class="ctrl-label">Padding</span>
                                     <input type="checkbox" id="pipelinePadding" onchange="updatePipelineParams()"
                                         checked />
-                                    <span class="small mono dim">Same (1)</span>
+                                    <span class="small mono dim">SAME</span>
+                                </div>
+                            </div>
+                            <div class="row mt-8" style="gap:10px; flex-wrap:wrap; align-items:flex-end;">
+                                <div class="ctrl-row" style="margin-bottom:0;">
+                                    <label class="ctrl-label" for="pipelinePoolSize">Pool size</label>
+                                    <input type="number" id="pipelinePoolSize" class="pipeline-dim-input" min="1" max="11"
+                                        value="2" step="1" onchange="updatePipelineParams()" title="Pooling Kp×Kp" />
+                                </div>
+                                <div class="ctrl-row" style="margin-bottom:0;">
+                                    <label class="ctrl-label" for="pipelinePoolStride">Pool stride</label>
+                                    <input type="number" id="pipelinePoolStride" class="pipeline-dim-input" min="1"
+                                        max="8" value="1" step="1" onchange="updatePipelineParams()" />
                                 </div>
                                 <div class="ctrl-row" style="margin-bottom:0;">
                                     <span class="ctrl-label">Pool</span>
@@ -262,7 +282,7 @@
                                     <div class="small mono dim" id="pipelineFeatureSize"></div>
                                 </div>
                                 <div class="col">
-                                    <div class="small dim">Pooling (2×2, stride 2)</div>
+                                    <div class="small dim mono" id="pipelinePoolHeading">Pooling</div>
                                     <canvas id="pipelinePoolCanvas" width="120" height="120"></canvas>
                                     <div class="small mono dim" id="pipelinePoolSize"></div>
                                 </div>
