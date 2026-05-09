@@ -394,63 +394,298 @@ function initFlatDemo() {
 }
 
 /* ================================================================
-   FULL PIPELINE DEMO (Section 1, bottom)
+   FULL CNN PIPELINE (Section 1, bottom)
    ================================================================ */
 const PIPELINE_INPUT_SIZE = 5;
 const PIPELINE_KERN_SIZE = 3;
-let pipelineInputData  = [];
+let pipelineInputData = [];
 let pipelineKernelData = [];
 let pipelineAnimRunning = false;
-let pipelineAnimAbort   = false;
+let pipelineAnimAbort = false;
+let pipelinePaused = false;
+/** @type {{resolve: Function|null}|null} */
+let pipelinePauseWait = null;
+let pipelineInputCells = []; // [r][c] -> HTMLElement
+
+function pipelineClamp01(t) {
+  return Math.max(0, Math.min(1, t));
+}
+
+function syncPipelinePaddingClass() {
+  const grid = document.getElementById('pipelineInputGrid');
+  if (!grid) return;
+  const on = !!(document.getElementById('pipelinePadding')?.checked);
+  grid.classList.toggle('pipeline-input-grid--pad', on);
+}
+
+function clearPipelineConvHighlight() {
+  const grid = document.getElementById('pipelineInputGrid');
+  if (!grid) return;
+  grid.querySelectorAll('.pipeline-cell-conv-highlight').forEach(el => {
+    el.classList.remove('pipeline-cell-conv-highlight');
+  });
+}
+
+/** Visual + index layout matches conv tensor: 5×5 (no pad) or 7×7 with border of implicit zeros. */
+function setPipelineConvHighlight(paddedOriginR, paddedOriginC, _stride, padding) {
+  clearPipelineConvHighlight();
+  const inpDiv = document.getElementById('pipelineInputGrid');
+  if (!inpDiv) return;
+  const dim = padding ? PIPELINE_INPUT_SIZE + 2 : PIPELINE_INPUT_SIZE;
+  for (let kr = 0; kr < PIPELINE_KERN_SIZE; kr++) {
+    for (let kc = 0; kc < PIPELINE_KERN_SIZE; kc++) {
+      const pr = paddedOriginR + kr;
+      const pc = paddedOriginC + kc;
+      if (pr < 0 || pc < 0 || pr >= dim || pc >= dim) continue;
+      const el = inpDiv.children[pr * dim + pc];
+      if (el) el.classList.add('pipeline-cell-conv-highlight');
+    }
+  }
+}
+
+function pipelineAppendTrace(traceEl, idx, expr, val) {
+  const row = document.createElement('div');
+  row.className = 'calc-trace-row';
+  row.innerHTML =
+    `<span class="calc-trace-idx">${idx}</span>` +
+    `<span class="calc-trace-expr">${expr}</span>` +
+    `<span class="calc-trace-val">${val}</span>`;
+  traceEl.appendChild(row);
+  traceEl.scrollTop = traceEl.scrollHeight;
+}
+
+function pipelineDeterministicDenseParams(flatVec, nNeurons) {
+  const nIn = flatVec.length;
+  let h = 2166136261 >>> 0;
+  flatVec.forEach((v, i) => {
+    const iv = Math.floor((v + 999) * 10000 + (i + 1) * 97);
+    h = Math.imul(h ^ iv, 16777619) >>> 0;
+  });
+  const W = [];
+  for (let i = 0; i < nNeurons; i++) {
+    const row = [];
+    for (let j = 0; j < nIn; j++) {
+      const seed = (((h >>> 0) ^ (i + 1) * 92837111 ^ j * 2654435761) >>> 0) / 4294967295;
+      row.push(parseFloat((Math.sin(seed * Math.PI * 2) * 0.85).toFixed(4)));
+      h ^= (j + i * 13) >>> 0;
+    }
+    W.push(row);
+  }
+  const b = [];
+  for (let i = 0; i < nNeurons; i++) {
+    const seed = (((h >>> 0) ^ (i + 1) * 1103515245) >>> 0) / 4294967295;
+    b.push(parseFloat((Math.cos(seed * Math.PI * 2) * 0.25).toFixed(4)));
+  }
+  return { W, b };
+}
+
+/** Build padded tensor for convolution; pad = 1 when "same" ON, else 0. */
+function pipelineBuildPadded(input, padding) {
+  if (!padding) return input.map(r => [...r]);
+  const s = PIPELINE_INPUT_SIZE;
+  return Array.from({ length: s + 2 }, (_, r) =>
+    Array.from({ length: s + 2 }, (_, c) => {
+      if (r === 0 || r === s + 1 || c === 0 || c === s + 1) return 0;
+      return input[r - 1][c - 1];
+    })
+  );
+}
+
+function pipelineGridMinMax(mat) {
+  let mn = Infinity, mx = -Infinity;
+  mat.forEach(row => row.forEach(v => {
+    mn = Math.min(mn, v);
+    mx = Math.max(mx, v);
+  }));
+  if (mx === mn) mx = mn + 1e-9;
+  return { mn, mx };
+}
+
+/** Resize canvas to fit grid with sensible cell size caps. */
+function pipelineSizeCanvasForGrid(canvas, rows, cols, minCell = 22, maxCell = 40) {
+  const target = Math.round(Math.min(maxCell, Math.max(minCell,
+    cols > rows ? 200 / cols : 200 / rows)));
+  const cw = Math.max(Math.round(target * cols), cols * minCell * 0.5);
+  const ch = Math.max(Math.round(target * rows), rows * minCell * 0.5);
+  canvas.width = cw;
+  canvas.height = ch;
+}
+
+/**
+ * Heatmap grid with centered numeric labels; optional outer highlight rectangle
+ * in OUTPUT grid coords (yellow border region).
+ */
+function pipelineDrawHeatNumberGrid(canvas, data2d, highlightOrNull) {
+  const rows = data2d.length;
+  const cols = data2d[0].length;
+  pipelineSizeCanvasForGrid(canvas, rows, cols, 26, 48);
+  const ctx = canvas.getContext('2d');
+  const { mn, mx } = pipelineGridMinMax(data2d);
+  const cw = canvas.width / cols;
+  const ch = canvas.height / rows;
+
+  ctx.fillStyle = '#1e1e2e';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const v = data2d[r][c];
+      const t = pipelineClamp01((v - mn) / (mx - mn));
+      const [rr, gg, bb] = heatColor(t);
+      ctx.fillStyle = `rgb(${rr},${gg},${bb})`;
+      ctx.fillRect(c * cw, r * ch, cw, ch);
+      ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(c * cw + 0.5, r * ch + 0.5, cw - 1, ch - 1);
+      ctx.fillStyle = t > 0.55 ? '#111' : '#eef';
+      ctx.font = `600 ${Math.max(10, Math.min(cw, ch) * 0.32)}px JetBrains Mono, monospace`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      const label = typeof v === 'number' ? (Math.abs(v) >= 100 ? v.toFixed(0) :
+        Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(2)) : String(v);
+      ctx.fillText(label, (c + 0.5) * cw, (r + 0.55) * ch);
+    }
+  }
+
+  if (highlightOrNull && typeof highlightOrNull.r0 === 'number' && highlightOrNull.r0 >= 0) {
+    const { r0, c0 } = highlightOrNull;
+    const hr = Math.max(1, Math.min(rows - r0, highlightOrNull.h || 2));
+    const hc = Math.max(1, Math.min(cols - c0, highlightOrNull.w || 2));
+    ctx.strokeStyle = '#f7c948';
+    ctx.lineWidth = 3;
+    ctx.strokeRect(c0 * cw + 2, r0 * ch + 2, hc * cw - 4, hr * ch - 4);
+  }
+}
+
+function pipelineDrawVectorStrip(canvas, values, revealedCount) {
+  const n = values.length;
+  const h = 28;
+  if (n === 0) {
+    canvas.width = 40;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#1e1e2e';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    return;
+  }
+  const cellW = Math.max(22, Math.min(44, Math.floor(240 / n)));
+  canvas.width = cellW * n;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  let mn = Math.min(...values), mx = Math.max(...values);
+  if (mx === mn) mx = mn + 1e-9;
+  for (let i = 0; i < n; i++) {
+    const v = values[i];
+    const t = pipelineClamp01((v - mn) / (mx - mn));
+    const [rr, gg, bb] = heatColor(t);
+    ctx.fillStyle = i < revealedCount ? `rgb(${rr},${gg},${bb})` : '#2a2a3c';
+    ctx.fillRect(i * cellW, 0, cellW, h);
+    ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+    ctx.strokeRect(i * cellW + 0.5, 0.5, cellW - 1, h - 1);
+    if (i < revealedCount) {
+      ctx.fillStyle = t > 0.55 ? '#111' : '#eef';
+      ctx.font = `600 ${Math.max(9, cellW * 0.34)}px JetBrains Mono, monospace`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      const label = Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(2);
+      ctx.fillText(label, (i + 0.5) * cellW, h / 2 + 2);
+    }
+  }
+}
 
 function initFullPipelineDemo() {
-  // Init data
-  pipelineInputData = Array.from({length: PIPELINE_INPUT_SIZE}, () =>
-    Array.from({length: PIPELINE_INPUT_SIZE}, () => Math.round(Math.random() * 9))
+  pipelineInputData = Array.from({ length: PIPELINE_INPUT_SIZE }, () =>
+    Array.from({ length: PIPELINE_INPUT_SIZE }, () => Math.round(Math.random() * 9))
   );
-  pipelineKernelData = [[-1,-1,-1],[-1,8,-1],[-1,-1,-1]];
+  pipelineKernelData = [[-1, -1, -1], [-1, 8, -1], [-1, -1, -1]];
+  pipelineInputCells = [];
   renderPipelineGrids();
   resetPipelineAnimation();
 }
+
 function renderPipelineGrids() {
-  // Input grid
   const inpDiv = document.getElementById('pipelineInputGrid');
+  if (!inpDiv) return;
   inpDiv.innerHTML = '';
-  inpDiv.style.gridTemplateColumns = `repeat(${PIPELINE_INPUT_SIZE}, 38px)`;
-  for (let r = 0; r < PIPELINE_INPUT_SIZE; r++) {
-    for (let c = 0; c < PIPELINE_INPUT_SIZE; c++) {
-      const inp = document.createElement('input');
-      inp.type = 'number'; inp.min = '0'; inp.max = '9'; inp.step = '1';
-      inp.value = pipelineInputData[r][c];
-      inp.style.background = cellColor(pipelineInputData[r][c], 0, 9);
-      inp.style.color = pipelineInputData[r][c] > 5 ? '#111' : '#eee';
-      inp.addEventListener('input', () => {
-        if (pipelineAnimRunning) return;
-        pipelineInputData[r][c] = parseFloat(inp.value) || 0;
-        inp.style.background = cellColor(pipelineInputData[r][c], 0, 9);
-        inp.style.color = pipelineInputData[r][c] > 5 ? '#111' : '#eee';
-        // Clear outputs when user edits
-        resetPipelineAnimation();
-      });
-      inpDiv.appendChild(inp);
+  inpDiv.style.display = 'inline-grid';
+  inpDiv.style.gap = '2px';
+  const padOn = !!document.getElementById('pipelinePadding')?.checked;
+  const gridDim = padOn ? PIPELINE_INPUT_SIZE + 2 : PIPELINE_INPUT_SIZE;
+  inpDiv.style.gridTemplateColumns = `repeat(${gridDim}, 38px)`;
+  pipelineInputCells = [];
+  for (let r = 0; r < PIPELINE_INPUT_SIZE; r++) pipelineInputCells[r] = [];
+
+  const appendZeroPadCell = () => {
+    const z = document.createElement('span');
+    z.className = 'pipeline-pad-zero-cell';
+    z.textContent = '0';
+    z.title = 'Implicit zero (same padding — not editable)';
+    z.style.background = cellColor(0, 0, 9);
+    z.style.color = '#eee';
+    inpDiv.appendChild(z);
+  };
+
+  const appendEditable = (ir, ic) => {
+    const inp = document.createElement('input');
+    inp.type = 'number';
+    inp.min = '0';
+    inp.max = '9';
+    inp.step = '1';
+    inp.className = 'pipeline-input-cell';
+    inp.dataset.r = String(ir);
+    inp.dataset.c = String(ic);
+    inp.value = pipelineInputData[ir][ic];
+    inp.disabled = !!(pipelineAnimRunning && !pipelinePaused);
+    inp.style.background = cellColor(pipelineInputData[ir][ic], 0, 9);
+    inp.style.color = pipelineInputData[ir][ic] > 5 ? '#111' : '#eee';
+    inp.addEventListener('input', () => {
+      if (pipelineAnimRunning && !pipelinePaused) return;
+      let x = parseInt(inp.value, 10);
+      if (!Number.isFinite(x)) x = 0;
+      x = Math.max(0, Math.min(9, x));
+      pipelineInputData[ir][ic] = x;
+      inp.value = x;
+      inp.style.background = cellColor(pipelineInputData[ir][ic], 0, 9);
+      inp.style.color = pipelineInputData[ir][ic] > 5 ? '#111' : '#eee';
+      resetPipelineAnimation();
+    });
+    inpDiv.appendChild(inp);
+    pipelineInputCells[ir][ic] = inp;
+  };
+
+  if (padOn) {
+    const last = PIPELINE_INPUT_SIZE + 1;
+    for (let r = 0; r <= last; r++) {
+      for (let c = 0; c <= last; c++) {
+        const isBorder = (r === 0 || r === last || c === 0 || c === last);
+        if (isBorder) appendZeroPadCell();
+        else appendEditable(r - 1, c - 1);
+      }
+    }
+  } else {
+    for (let r = 0; r < PIPELINE_INPUT_SIZE; r++) {
+      for (let c = 0; c < PIPELINE_INPUT_SIZE; c++) appendEditable(r, c);
     }
   }
-  // Kernel grid
+  syncPipelinePaddingClass();
+
   const kernDiv = document.getElementById('pipelineKernelGrid');
   kernDiv.innerHTML = '';
   kernDiv.style.gridTemplateColumns = `repeat(${PIPELINE_KERN_SIZE}, 44px)`;
   for (let r = 0; r < PIPELINE_KERN_SIZE; r++) {
     for (let c = 0; c < PIPELINE_KERN_SIZE; c++) {
       const inp = document.createElement('input');
-      inp.type = 'number'; inp.step = '0.1';
+      inp.type = 'number';
+      inp.step = '0.1';
       inp.value = pipelineKernelData[r][c];
+      inp.disabled = !!(pipelineAnimRunning && !pipelinePaused);
       inp.style.background = cellColor(pipelineKernelData[r][c], -3, 3);
       inp.style.color = Math.abs(pipelineKernelData[r][c]) < 1 ? '#eee' : '#111';
       inp.addEventListener('input', () => {
-        if (pipelineAnimRunning) return;
+        if (pipelineAnimRunning && !pipelinePaused) return;
         pipelineKernelData[r][c] = parseFloat(inp.value) || 0;
         resetPipelineAnimation();
-        renderPipelineGrids(); // refresh colors
+        renderPipelineGrids();
       });
       kernDiv.appendChild(inp);
     }
@@ -458,8 +693,9 @@ function renderPipelineGrids() {
 }
 
 function randomizePipelineInput() {
-  pipelineInputData = Array.from({length: PIPELINE_INPUT_SIZE}, () =>
-    Array.from({length: PIPELINE_INPUT_SIZE}, () => Math.round(Math.random() * 9))
+  if (pipelineAnimRunning && !pipelinePaused) return;
+  pipelineInputData = Array.from({ length: PIPELINE_INPUT_SIZE }, () =>
+    Array.from({ length: PIPELINE_INPUT_SIZE }, () => Math.round(Math.random() * 9))
   );
   renderPipelineGrids();
   resetPipelineAnimation();
@@ -467,223 +703,373 @@ function randomizePipelineInput() {
 
 function setPipelineKernelPreset(name) {
   const presets = {
-    'edge-h':  [[-1,-1,-1],[0,0,0],[1,1,1]],
-    'edge-v':  [[-1,0,1],[-1,0,1],[-1,0,1]],
-    'blur':    [[1/9,1/9,1/9],[1/9,1/9,1/9],[1/9,1/9,1/9]],
-    'sharpen': [[0,-1,0],[-1,5,-1],[0,-1,0]],
+    'edge-h':  [[-1, -1, -1], [0, 0, 0], [1, 1, 1]],
+    'edge-v':  [[-1, 0, 1], [-1, 0, 1], [-1, 0, 1]],
+    'blur':    [[1 / 9, 1 / 9, 1 / 9], [1 / 9, 1 / 9, 1 / 9], [1 / 9, 1 / 9, 1 / 9]],
+    'sharpen': [[0, -1, 0], [-1, 5, -1], [0, -1, 0]],
   };
-  pipelineKernelData = presets[name].map(r => [...r]);
+  pipelineKernelData = presets[name].map(rr => [...rr]);
   renderPipelineGrids();
   resetPipelineAnimation();
 }
 
 function updatePipelineParams() {
-  // Just reset the animation and redraw outputs (no active animation)
-  resetPipelineAnimation();
+  syncPipelinePaddingClass();
+  if (!pipelineAnimRunning) resetPipelineAnimation();
+}
+
+async function pipelineDelay() {
+  const raw = parseInt(document.getElementById('pipelineSpeed').value, 10);
+  const ms = Math.max(40, Math.min(500, Number.isFinite(raw) ? raw : 180));
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    if (pipelineAnimAbort) return false;
+    while (pipelinePaused && !pipelineAnimAbort) {
+      await new Promise(r => {
+        pipelinePauseWait = { resolve: r };
+      });
+      pipelinePauseWait = null;
+    }
+    if (pipelineAnimAbort) return false;
+    await sleep(Math.min(30, Math.max(0, end - Date.now())));
+  }
+  return true;
+}
+
+function pausePipelinePlayback() {
+  if (!pipelineAnimRunning || pipelinePaused) return;
+  pipelinePaused = true;
+  const btn = document.getElementById('btnPlayPipeline');
+  if (btn) btn.textContent = '▶ Resume';
+}
+
+function resumePipelinePlayback() {
+  if (!pipelineAnimRunning || !pipelinePaused) return;
+  pipelinePaused = false;
+  if (pipelinePauseWait) {
+    pipelinePauseWait.resolve();
+    pipelinePauseWait = null;
+  }
+  const btn = document.getElementById('btnPlayPipeline');
+  if (btn) btn.textContent = '⏸ Pause';
+}
+
+function togglePipelinePlayPause() {
+  if (pipelineAnimRunning && pipelinePaused) {
+    resumePipelinePlayback();
+    return;
+  }
+  if (pipelineAnimRunning && !pipelinePaused) {
+    pausePipelinePlayback();
+    return;
+  }
+  startPipelineAnimation();
+}
+
+function pipelineSetPlayButtonRunning() {
+  const btn = document.getElementById('btnPlayPipeline');
+  if (btn) btn.textContent = pipelinePaused ? '▶ Resume' : '⏸ Pause';
+}
+
+function pipelineSetPlayButtonIdle() {
+  const btn = document.getElementById('btnPlayPipeline');
+  if (btn) btn.textContent = '▶ Play';
 }
 
 function resetPipelineAnimation() {
-  pipelineAnimAbort = true;  // stop any running animation
-  document.getElementById('pipelineCalcTrace').innerHTML = '';
-  // Clear canvases
-  const canvases = ['pipelineFeatureCanvas','pipelinePoolCanvas','pipelineFlattenCanvas'];
-  canvases.forEach(id => {
-    const c = document.getElementById(id);
-    const ctx = c.getContext('2d');
-    ctx.clearRect(0,0,c.width,c.height);
-    ctx.fillStyle = '#1e1e2e';
-    ctx.fillRect(0,0,c.width,c.height);
-  });
-  document.getElementById('pipelineFeatureSize').textContent = '';
-  document.getElementById('pipelineDenseOutput').innerHTML = '';
+  pipelineAnimAbort = true;
+  pipelinePaused = false;
+  if (pipelinePauseWait) {
+    pipelinePauseWait.resolve();
+    pipelinePauseWait = null;
+  }
   pipelineAnimRunning = false;
-  document.getElementById('btnPlayPipeline').disabled = false;
+
+  clearPipelineConvHighlight();
+
+  const trace = document.getElementById('pipelineCalcTrace');
+  if (trace) trace.innerHTML = '';
+
+  ['pipelineFeatureCanvas', 'pipelinePoolCanvas', 'pipelineFlattenCanvas'].forEach(id => {
+    const c = document.getElementById(id);
+    if (!c) return;
+    const ctx = c.getContext('2d');
+    ctx.clearRect(0, 0, c.width, c.height);
+    ctx.fillStyle = '#1e1e2e';
+    ctx.fillRect(0, 0, c.width, c.height);
+  });
+
+  const fs = document.getElementById('pipelineFeatureSize');
+  if (fs) fs.textContent = '';
+  const ps = document.getElementById('pipelinePoolSize');
+  if (ps) ps.textContent = '';
+  const ft = document.getElementById('pipelineFlattenText');
+  if (ft) ft.textContent = '';
+  const dw = document.getElementById('pipelineDenseWeights');
+  if (dw) dw.innerHTML = '';
+  const dout = document.getElementById('pipelineDenseOutput');
+  if (dout) dout.innerHTML = '';
+
+  pipelineSetPlayButtonIdle();
+  renderPipelineGrids();
 }
 
-// Animation engine
-async function playPipelineAnimation() {
+function featureMapToNested(featureMap2d, oh, ow) {
+  const m = [];
+  for (let r = 0; r < oh; r++) {
+    const row = [];
+    for (let c = 0; c < ow; c++)
+      row.push(featureMap2d[r][c]);
+    m.push(row);
+  }
+  return m;
+}
+
+async function startPipelineAnimation() {
   if (pipelineAnimRunning) return;
   pipelineAnimRunning = true;
   pipelineAnimAbort = false;
-  document.getElementById('btnPlayPipeline').disabled = true;
-  const stride  = parseInt(document.getElementById('pipelineStride').value);
-  const padding = document.getElementById('pipelinePadding').checked;
-  const poolType = document.getElementById('pipelinePoolType').value; // 'max' or 'min'
-  const speedMs = parseInt(document.getElementById('pipelineSpeed').value);
-  
-  const input  = pipelineInputData;
+  pipelinePaused = false;
+  pipelineSetPlayButtonRunning();
+  renderPipelineGrids();
+
+  const stride = parseInt(document.getElementById('pipelineStride').value, 10) === 2 ? 2 : 1;
+  const padding = !!document.getElementById('pipelinePadding').checked;
+  const poolType = document.getElementById('pipelinePoolType').value;
+  const trace = document.getElementById('pipelineCalcTrace');
+
+  const input = pipelineInputData;
   const kernel = pipelineKernelData;
-  
-  // ---------- Step 1: Convolution ----------
-  // Pad input if Same padding
-  let padded = input;
-  let padSize = 0;
-  if (padding) {
-    padSize = 1;
-    const s = PIPELINE_INPUT_SIZE;
-    padded = Array.from({length: s+2}, (_, r) =>
-      Array.from({length: s+2}, (_, c) => {
-        if (r===0||r===s+1||c===0||c===s+1) return 0;
-        return input[r-1][c-1];
-      })
-    );
+  const padded = pipelineBuildPadded(input, padding);
+  const ph = padded.length;
+  const pw = padded[0].length;
+
+  let oh = Math.floor((ph - PIPELINE_KERN_SIZE) / stride) + 1;
+  let ow = Math.floor((pw - PIPELINE_KERN_SIZE) / stride) + 1;
+
+  const edgeMsg =
+    ph < PIPELINE_KERN_SIZE || pw < PIPELINE_KERN_SIZE || oh < 1 || ow < 1;
+  if (edgeMsg) {
+    pipelineAppendTrace(trace, '—', 'Convolution output has no valid positions for this stride/padding/kernel.', '—');
+    pipelineAnimRunning = false;
+    pipelineSetPlayButtonIdle();
+    renderPipelineGrids();
+    return;
   }
-  const ph = padded.length, pw = padded[0].length;
-  const oh = Math.floor((ph - PIPELINE_KERN_SIZE) / stride) + 1;
-  const ow = Math.floor((pw - PIPELINE_KERN_SIZE) / stride) + 1;
-  
-  // Prepare output array
-  const featureMap = Array.from({length: oh}, () => new Float32Array(ow));
-  
-  // Feature canvas setup
+
+  const featureMap = Array.from({ length: oh }, () => Array(ow).fill(0));
   const fCanvas = document.getElementById('pipelineFeatureCanvas');
-  const fCtx = fCanvas.getContext('2d');
-  const fCellW = fCanvas.width / ow;
-  const fCellH = fCanvas.height / oh;
-  fCtx.fillStyle = '#1e1e2e';
-  fCtx.fillRect(0,0,fCanvas.width,fCanvas.height);
   document.getElementById('pipelineFeatureSize').textContent = `${oh}×${ow}`;
-  
-  const traceDiv = document.getElementById('pipelineCalcTrace');
-  
-  // Animate each output position
+  pipelineDrawHeatNumberGrid(fCanvas, featureMap.map(r => r.map(() => 0)));
+
+  pipelineAppendTrace(trace, 'conv', `${padding ? 'same (1-pixel zero pad)' : 'no pad'}, stride=${stride}`, 'start');
+
   for (let r = 0; r < oh; r++) {
     for (let c = 0; c < ow; c++) {
-      if (pipelineAnimAbort) { pipelineAnimRunning = false; return; }
-      // Highlight input window on the input grid (highlight the input cells)
-      // We can do this by temporarily adding a class to the grid inputs.
-      // For simplicity, we'll just show the trace; visual highlight of input area is done via border but could be complex.
-      // We'll instead draw a yellow rectangle on the input canvas? We don't have an input canvas, just editable cells.
-      // We'll skip visual highlight on the grid itself, but show the window coordinates in trace.
-      
-      // Compute dot product
+      if (!(await pipelineDelay()) || pipelineAnimAbort) break;
+
+      const pr0 = r * stride;
+      const pc0 = c * stride;
+      setPipelineConvHighlight(pr0, pc0, stride, padding);
+
       let sum = 0;
       const terms = [];
       for (let kr = 0; kr < PIPELINE_KERN_SIZE; kr++) {
         for (let kc = 0; kc < PIPELINE_KERN_SIZE; kc++) {
-          const iv = padded[r*stride + kr][c*stride + kc];
+          const iv = padded[pr0 + kr][pc0 + kc];
           const kv = kernel[kr][kc];
           sum += iv * kv;
-          terms.push(`${iv}×${kv.toFixed(2)}`);
+          terms.push(`${iv}×${kv.toFixed(3)}`);
         }
       }
-      const val = parseFloat(sum.toFixed(2));
+      const val = parseFloat(sum.toFixed(4));
       featureMap[r][c] = val;
-      
-      // Color the output cell (heatmap)
-      const t = Math.max(0, Math.min(1, (val + 10) / 20)); // rough scale
-      const [rr, gg, bb] = heatColor(t);
-      fCtx.fillStyle = `rgb(${rr},${gg},${bb})`;
-      fCtx.fillRect(c * fCellW, r * fCellH, fCellW, fCellH);
-      
-      // Show trace
-      traceDiv.innerHTML = `<div class="calc-trace-row">
-        <span class="calc-trace-idx">[${r}][${c}]</span>
-        <span class="calc-trace-expr">${terms.join(' + ')}</span>
-        <span class="calc-trace-val">= ${val.toFixed(2)}</span>
-      </div>`;
-      
-      await sleep(speedMs);
+
+      pipelineDrawHeatNumberGrid(fCanvas, featureMapToNested(featureMap, oh, ow));
+      pipelineAppendTrace(trace, `[${r}][${c}]`, terms.join(' + '), `sum = ${val.toFixed(4)}`);
+
+      if (pipelineAnimAbort) break;
     }
+    if (pipelineAnimAbort) break;
   }
-  
-  // After convolution, feature map is complete.
-  traceDiv.innerHTML += `<div class="calc-trace-row" style="color:var(--accent3)">✔ Convolution done. Output: ${oh}×${ow}</div>`;
-  
-  // ---------- Step 2: Pooling (2×2 window, stride 2) ----------
-  if (oh < 2 || ow < 2) {
-    traceDiv.innerHTML += `<div class="calc-trace-row" style="color:var(--warning)">⚠ Output too small for pooling (${oh}×${ow}) – skipping.</div>`;
+
+  clearPipelineConvHighlight();
+
+  if (pipelineAnimAbort) {
+    pipelineAnimRunning = false;
+    pipelineSetPlayButtonIdle();
+    renderPipelineGrids();
+    return;
+  }
+
+  pipelineAppendTrace(trace, 'conv', `Done. Feature map shape ${oh}×${ow}.`, `step ${stride}`);
+
+  const poolPossible = oh >= 2 && ow >= 2;
+  let flatVec = [];
+  let pooled2d = null;
+
+  const pCanvas = document.getElementById('pipelinePoolCanvas');
+  if (!poolPossible) {
+    pipelineAppendTrace(trace, 'pool', `⚠ Map ${oh}×${ow} → cannot tile 2×2 non-overlapping windows. Flatten raw map.`, '—');
+    for (let r = 0; r < oh; r++)
+      for (let c = 0; c < ow; c++)
+        flatVec.push(featureMap[r][c]);
+    document.getElementById('pipelinePoolSize').textContent = '—';
+    const emptyPool = [[0]];
+    pipelineDrawHeatNumberGrid(pCanvas, emptyPool);
   } else {
     const poolH = Math.floor(oh / 2);
     const poolW = Math.floor(ow / 2);
-    const pooled = Array.from({length: poolH}, () => new Float32Array(poolW));
-    
-    const pCanvas = document.getElementById('pipelinePoolCanvas');
-    const pCtx = pCanvas.getContext('2d');
-    const pCellW = pCanvas.width / poolW;
-    const pCellH = pCanvas.height / poolH;
-    pCtx.fillStyle = '#1e1e2e';
-    pCtx.fillRect(0,0,pCanvas.width,pCanvas.height);
-    
+    pooled2d = Array.from({ length: poolH }, () => Array(poolW).fill(0));
+    pipelineDrawHeatNumberGrid(pCanvas, pooled2d);
+    document.getElementById('pipelinePoolSize').textContent = `${poolH}×${poolW}`;
+
+    pipelineAppendTrace(trace, 'pool', `${poolType} pool 2×2, stride 2`, `windows ${poolH}×${poolW}`);
+
     for (let pr = 0; pr < poolH; pr++) {
       for (let pc = 0; pc < poolW; pc++) {
-        if (pipelineAnimAbort) { pipelineAnimRunning = false; return; }
+        if (!(await pipelineDelay()) || pipelineAnimAbort) break;
+
         const vals = [];
-        for (let r = 0; r < 2; r++) {
-          for (let c = 0; c < 2; c++) {
-            vals.push(featureMap[pr*2+r][pc*2+c]);
-          }
-        }
-        const poolVal = poolType === 'max' ? Math.max(...vals) : Math.min(...vals);
-        pooled[pr][pc] = poolVal;
-        
-        // color
-        const t = Math.max(0, Math.min(1, (poolVal + 10) / 20));
-        const [rr, gg, bb] = heatColor(t);
-        pCtx.fillStyle = `rgb(${rr},${gg},${bb})`;
-        pCtx.fillRect(pc * pCellW, pr * pCellH, pCellW, pCellH);
-        
-        traceDiv.innerHTML = `<div class="calc-trace-row">
-          <span class="calc-trace-idx">[${pr}][${pc}]</span>
-          <span class="calc-trace-expr">${poolType}(${vals.map(v=>v.toFixed(2)).join(', ')})</span>
-          <span class="calc-trace-val">= ${poolVal.toFixed(2)}</span>
-        </div>`;
-        await sleep(speedMs);
+        for (let rr = 0; rr < 2; rr++)
+          for (let cc = 0; cc < 2; cc++)
+            vals.push(featureMap[pr * 2 + rr][pc * 2 + cc]);
+
+        const poolVal =
+          poolType === 'max' ? Math.max(...vals) :
+            poolType === 'min' ? Math.min(...vals) : vals[0];
+        pooled2d[pr][pc] = poolVal;
+
+        const fmShow = featureMapToNested(featureMap, oh, ow);
+        const hiR = pr * 2;
+        const hiC = pc * 2;
+        pipelineDrawHeatNumberGrid(fCanvas, fmShow, { r0: hiR, c0: hiC, h: 2, w: 2 });
+        pipelineDrawHeatNumberGrid(pCanvas, pooled2d);
+
+        const label = poolType === 'max' ? 'max' : 'min';
+        pipelineAppendTrace(trace, `[${pr}][${pc}]`,
+          `${label}(${vals.map(v => v.toFixed(4)).join(', ')})`,
+          `${poolVal.toFixed(4)}`);
+        if (pipelineAnimAbort) break;
       }
+      if (pipelineAnimAbort) break;
     }
-    traceDiv.innerHTML += `<div class="calc-trace-row" style="color:var(--accent3)">✔ Pooling done. Output: ${poolH}×${poolW}</div>`;
-    
-    // ---------- Step 3: Flatten ----------
-    const flatVec = [];
+
+    pipelineDrawHeatNumberGrid(fCanvas, featureMapToNested(featureMap, oh, ow));
+
+    flatVec = [];
     for (let r = 0; r < poolH; r++)
       for (let c = 0; c < poolW; c++)
-        flatVec.push(pooled[r][c]);
-    
-    const flatCanvas = document.getElementById('pipelineFlattenCanvas');
-    drawVectorStrip(flatCanvas, flatVec, 24);
-    traceDiv.innerHTML += `<div class="calc-trace-row" style="color:var(--accent3)">✔ Flattened vector: ${flatVec.map(v=>v.toFixed(2)).join(', ')}</div>`;
-    await sleep(speedMs);
-    
-    // ---------- Step 4: Dense layer (2 neurons) ----------
-    // Fixed toy weights (2×4) and biases, based on a seed from the flatVec for reproducibility
-    const seed = flatVec.reduce((a,b) => a+b, 0);
-    const nNeurons = 2;
-    const nInputs = flatVec.length;
-    const W = Array.from({length: nNeurons}, (_, i) =>
-      Array.from({length: nInputs}, (_, j) =>
-        parseFloat((Math.sin(seed*(i+1)*(j+1)*0.37)*0.8).toFixed(2))
-      )
+        flatVec.push(pooled2d[r][c]);
+
+    if (pipelineAnimAbort) {
+      pipelineAnimRunning = false;
+      pipelineSetPlayButtonIdle();
+      renderPipelineGrids();
+      return;
+    }
+
+    pipelineAppendTrace(trace, 'pool', `Done ${poolType} pooling. Flatten (${flatVec.length}).`, `${poolH}×${poolW}`);
+  }
+
+  if (pipelineAnimAbort) {
+    pipelineAnimRunning = false;
+    pipelineSetPlayButtonIdle();
+    renderPipelineGrids();
+    return;
+  }
+
+  const ftEl = document.getElementById('pipelineFlattenText');
+  const flatCv = document.getElementById('pipelineFlattenCanvas');
+  for (let k = 0; k <= flatVec.length; k++) {
+    if (!(await pipelineDelay()) || pipelineAnimAbort) break;
+    pipelineDrawVectorStrip(flatCv, flatVec, k);
+    if (k === flatVec.length)
+      ftEl.textContent = `[ ${flatVec.map(v => v.toFixed(4)).join(', ')} ]`;
+    else ftEl.textContent = flatVec.slice(0, k).map(v => v.toFixed(4)).join(', ');
+  }
+
+  if (pipelineAnimAbort) {
+    pipelineAnimRunning = false;
+    pipelineSetPlayButtonIdle();
+    renderPipelineGrids();
+    return;
+  }
+
+  pipelineAppendTrace(trace, 'flat', ftEl.textContent, `dim=${flatVec.length}`);
+
+  const nNeurons = 2;
+  if (flatVec.length === 0) {
+    pipelineAppendTrace(trace, 'dense', 'No values to flatten — dense layer skipped.', '—');
+    pipelineAnimRunning = false;
+    pipelineSetPlayButtonIdle();
+    renderPipelineGrids();
+    return;
+  }
+
+  const { W, b } = pipelineDeterministicDenseParams(flatVec, nNeurons);
+
+  const wDisplay = document.getElementById('pipelineDenseWeights');
+  wDisplay.innerHTML = '';
+
+  const wTitle = document.createElement('div');
+  wTitle.className = 'small dim mono';
+  wTitle.textContent = `W (${nNeurons}×${flatVec.length})`;
+  wDisplay.appendChild(wTitle);
+
+  W.forEach((row, wi) => {
+    const nrow = row.map((wv, ji) =>
+      `<span title="W[${wi}][${ji}]">${wv}</span>`
+    ).join(' ');
+    const line = document.createElement('div');
+    line.style.lineHeight = '1.55';
+    line.innerHTML =
+      `<span style="color:var(--accent3)">${wi}</span> &nbsp;` + nrow;
+    wDisplay.appendChild(line);
+  });
+  const bLine = document.createElement('div');
+  bLine.className = 'mt-8';
+  bLine.style.color = 'var(--text-dim)';
+  bLine.textContent = `b = [ ${b.map(x => x.toFixed(4)).join(', ')} ]`;
+  wDisplay.appendChild(bLine);
+
+  const denseOut = [];
+  for (let i = 0; i < nNeurons; i++) {
+    if (!(await pipelineDelay()) || pipelineAnimAbort) break;
+
+    const pre = W[i].reduce((s, w, j) => s + w * flatVec[j], b[i]);
+    const post = Math.max(0, parseFloat(pre.toFixed(4)));
+    denseOut.push(post);
+
+    const dots = W[i].map((w, j) => `${w.toFixed(4)}×(${flatVec[j].toFixed(4)})`).join(' + ');
+    pipelineAppendTrace(trace,
+      `dense[${i}]`,
+      `( ${dots} ) + ${b[i].toFixed(4)}`,
+      `raw=${pre.toFixed(4)} → ReLU=${post.toFixed(4)}`
     );
-    const b = Array.from({length: nNeurons}, (_, i) =>
-      parseFloat((Math.cos(seed*(i+1)*0.51)*0.2).toFixed(2))
-    );
-    const denseOut = W.map((wRow, i) => {
-      const dot = wRow.reduce((s, w, j) => s + w * flatVec[j], b[i]);
-      return Math.max(0, parseFloat(dot.toFixed(2))); // ReLU
-    });
-    
-    // Show weight matrix and result
-    const denseDiv = document.getElementById('pipelineDenseOutput');
-    denseDiv.innerHTML = '';
-    denseDiv.style.gridTemplateColumns = `repeat(2, 44px)`;
+
+    const dout = document.getElementById('pipelineDenseOutput');
+    dout.innerHTML = '';
+    dout.style.gridTemplateColumns = `repeat(${nNeurons}, 54px)`;
     denseOut.forEach(v => {
       const cell = document.createElement('div');
       cell.className = 'num-cell';
-      const t = Math.max(0, Math.min(1, v / (Math.max(...denseOut)+1e-6)));
-      const [rr, gg, bb] = heatColor(t);
-      cell.style.background = `rgba(${rr},${gg},${bb},0.35)`;
-      cell.textContent = v.toFixed(2);
-      denseDiv.appendChild(cell);
+      const tHeat = denseOut.length ? v / (Math.max(...denseOut) + 1e-9) : 0;
+      const [rr, gg, bb] = heatColor(pipelineClamp01(tHeat));
+      cell.style.background = `rgba(${rr},${gg},${bb},0.42)`;
+      cell.textContent = v.toFixed(4);
+      dout.appendChild(cell);
     });
-    
-    traceDiv.innerHTML += `<div class="calc-trace-row" style="color:var(--accent3)">
-      <span class="calc-trace-idx">Dense</span>
-      <span class="calc-trace-expr">y = ReLU(W·x + b)</span>
-      <span class="calc-trace-val">[${denseOut.join(', ')}]</span>
-    </div>`;
-  } // end of pooling step
+
+    if (pipelineAnimAbort) break;
+  }
+
+  if (!pipelineAnimAbort)
+    pipelineAppendTrace(trace, 'dense', `y = ReLU(Wx + b)`, `[${denseOut.map(v => v.toFixed(4)).join(', ')}]`);
+
   pipelineAnimRunning = false;
-  document.getElementById('btnPlayPipeline').disabled = false;
+  pipelineSetPlayButtonIdle();
+  renderPipelineGrids();
 }
 
 /* ================================================================
