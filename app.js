@@ -394,6 +394,299 @@ function initFlatDemo() {
 }
 
 /* ================================================================
+   FULL PIPELINE DEMO (Section 1, bottom)
+   ================================================================ */
+const PIPELINE_INPUT_SIZE = 5;
+const PIPELINE_KERN_SIZE = 3;
+let pipelineInputData  = [];
+let pipelineKernelData = [];
+let pipelineAnimRunning = false;
+let pipelineAnimAbort   = false;
+
+function initFullPipelineDemo() {
+  // Init data
+  pipelineInputData = Array.from({length: PIPELINE_INPUT_SIZE}, () =>
+    Array.from({length: PIPELINE_INPUT_SIZE}, () => Math.round(Math.random() * 9))
+  );
+  pipelineKernelData = [[-1,-1,-1],[-1,8,-1],[-1,-1,-1]];
+  renderPipelineGrids();
+  resetPipelineAnimation();
+}
+function renderPipelineGrids() {
+  // Input grid
+  const inpDiv = document.getElementById('pipelineInputGrid');
+  inpDiv.innerHTML = '';
+  inpDiv.style.gridTemplateColumns = `repeat(${PIPELINE_INPUT_SIZE}, 38px)`;
+  for (let r = 0; r < PIPELINE_INPUT_SIZE; r++) {
+    for (let c = 0; c < PIPELINE_INPUT_SIZE; c++) {
+      const inp = document.createElement('input');
+      inp.type = 'number'; inp.min = '0'; inp.max = '9'; inp.step = '1';
+      inp.value = pipelineInputData[r][c];
+      inp.style.background = cellColor(pipelineInputData[r][c], 0, 9);
+      inp.style.color = pipelineInputData[r][c] > 5 ? '#111' : '#eee';
+      inp.addEventListener('input', () => {
+        if (pipelineAnimRunning) return;
+        pipelineInputData[r][c] = parseFloat(inp.value) || 0;
+        inp.style.background = cellColor(pipelineInputData[r][c], 0, 9);
+        inp.style.color = pipelineInputData[r][c] > 5 ? '#111' : '#eee';
+        // Clear outputs when user edits
+        resetPipelineAnimation();
+      });
+      inpDiv.appendChild(inp);
+    }
+  }
+  // Kernel grid
+  const kernDiv = document.getElementById('pipelineKernelGrid');
+  kernDiv.innerHTML = '';
+  kernDiv.style.gridTemplateColumns = `repeat(${PIPELINE_KERN_SIZE}, 44px)`;
+  for (let r = 0; r < PIPELINE_KERN_SIZE; r++) {
+    for (let c = 0; c < PIPELINE_KERN_SIZE; c++) {
+      const inp = document.createElement('input');
+      inp.type = 'number'; inp.step = '0.1';
+      inp.value = pipelineKernelData[r][c];
+      inp.style.background = cellColor(pipelineKernelData[r][c], -3, 3);
+      inp.style.color = Math.abs(pipelineKernelData[r][c]) < 1 ? '#eee' : '#111';
+      inp.addEventListener('input', () => {
+        if (pipelineAnimRunning) return;
+        pipelineKernelData[r][c] = parseFloat(inp.value) || 0;
+        resetPipelineAnimation();
+        renderPipelineGrids(); // refresh colors
+      });
+      kernDiv.appendChild(inp);
+    }
+  }
+}
+
+function randomizePipelineInput() {
+  pipelineInputData = Array.from({length: PIPELINE_INPUT_SIZE}, () =>
+    Array.from({length: PIPELINE_INPUT_SIZE}, () => Math.round(Math.random() * 9))
+  );
+  renderPipelineGrids();
+  resetPipelineAnimation();
+}
+
+function setPipelineKernelPreset(name) {
+  const presets = {
+    'edge-h':  [[-1,-1,-1],[0,0,0],[1,1,1]],
+    'edge-v':  [[-1,0,1],[-1,0,1],[-1,0,1]],
+    'blur':    [[1/9,1/9,1/9],[1/9,1/9,1/9],[1/9,1/9,1/9]],
+    'sharpen': [[0,-1,0],[-1,5,-1],[0,-1,0]],
+  };
+  pipelineKernelData = presets[name].map(r => [...r]);
+  renderPipelineGrids();
+  resetPipelineAnimation();
+}
+
+function updatePipelineParams() {
+  // Just reset the animation and redraw outputs (no active animation)
+  resetPipelineAnimation();
+}
+
+function resetPipelineAnimation() {
+  pipelineAnimAbort = true;  // stop any running animation
+  document.getElementById('pipelineCalcTrace').innerHTML = '';
+  // Clear canvases
+  const canvases = ['pipelineFeatureCanvas','pipelinePoolCanvas','pipelineFlattenCanvas'];
+  canvases.forEach(id => {
+    const c = document.getElementById(id);
+    const ctx = c.getContext('2d');
+    ctx.clearRect(0,0,c.width,c.height);
+    ctx.fillStyle = '#1e1e2e';
+    ctx.fillRect(0,0,c.width,c.height);
+  });
+  document.getElementById('pipelineFeatureSize').textContent = '';
+  document.getElementById('pipelineDenseOutput').innerHTML = '';
+  pipelineAnimRunning = false;
+  document.getElementById('btnPlayPipeline').disabled = false;
+}
+
+// Animation engine
+async function playPipelineAnimation() {
+  if (pipelineAnimRunning) return;
+  pipelineAnimRunning = true;
+  pipelineAnimAbort = false;
+  document.getElementById('btnPlayPipeline').disabled = true;
+  const stride  = parseInt(document.getElementById('pipelineStride').value);
+  const padding = document.getElementById('pipelinePadding').checked;
+  const poolType = document.getElementById('pipelinePoolType').value; // 'max' or 'min'
+  const speedMs = parseInt(document.getElementById('pipelineSpeed').value);
+  
+  const input  = pipelineInputData;
+  const kernel = pipelineKernelData;
+  
+  // ---------- Step 1: Convolution ----------
+  // Pad input if Same padding
+  let padded = input;
+  let padSize = 0;
+  if (padding) {
+    padSize = 1;
+    const s = PIPELINE_INPUT_SIZE;
+    padded = Array.from({length: s+2}, (_, r) =>
+      Array.from({length: s+2}, (_, c) => {
+        if (r===0||r===s+1||c===0||c===s+1) return 0;
+        return input[r-1][c-1];
+      })
+    );
+  }
+  const ph = padded.length, pw = padded[0].length;
+  const oh = Math.floor((ph - PIPELINE_KERN_SIZE) / stride) + 1;
+  const ow = Math.floor((pw - PIPELINE_KERN_SIZE) / stride) + 1;
+  
+  // Prepare output array
+  const featureMap = Array.from({length: oh}, () => new Float32Array(ow));
+  
+  // Feature canvas setup
+  const fCanvas = document.getElementById('pipelineFeatureCanvas');
+  const fCtx = fCanvas.getContext('2d');
+  const fCellW = fCanvas.width / ow;
+  const fCellH = fCanvas.height / oh;
+  fCtx.fillStyle = '#1e1e2e';
+  fCtx.fillRect(0,0,fCanvas.width,fCanvas.height);
+  document.getElementById('pipelineFeatureSize').textContent = `${oh}×${ow}`;
+  
+  const traceDiv = document.getElementById('pipelineCalcTrace');
+  
+  // Animate each output position
+  for (let r = 0; r < oh; r++) {
+    for (let c = 0; c < ow; c++) {
+      if (pipelineAnimAbort) { pipelineAnimRunning = false; return; }
+      // Highlight input window on the input grid (highlight the input cells)
+      // We can do this by temporarily adding a class to the grid inputs.
+      // For simplicity, we'll just show the trace; visual highlight of input area is done via border but could be complex.
+      // We'll instead draw a yellow rectangle on the input canvas? We don't have an input canvas, just editable cells.
+      // We'll skip visual highlight on the grid itself, but show the window coordinates in trace.
+      
+      // Compute dot product
+      let sum = 0;
+      const terms = [];
+      for (let kr = 0; kr < PIPELINE_KERN_SIZE; kr++) {
+        for (let kc = 0; kc < PIPELINE_KERN_SIZE; kc++) {
+          const iv = padded[r*stride + kr][c*stride + kc];
+          const kv = kernel[kr][kc];
+          sum += iv * kv;
+          terms.push(`${iv}×${kv.toFixed(2)}`);
+        }
+      }
+      const val = parseFloat(sum.toFixed(2));
+      featureMap[r][c] = val;
+      
+      // Color the output cell (heatmap)
+      const t = Math.max(0, Math.min(1, (val + 10) / 20)); // rough scale
+      const [rr, gg, bb] = heatColor(t);
+      fCtx.fillStyle = `rgb(${rr},${gg},${bb})`;
+      fCtx.fillRect(c * fCellW, r * fCellH, fCellW, fCellH);
+      
+      // Show trace
+      traceDiv.innerHTML = `<div class="calc-trace-row">
+        <span class="calc-trace-idx">[${r}][${c}]</span>
+        <span class="calc-trace-expr">${terms.join(' + ')}</span>
+        <span class="calc-trace-val">= ${val.toFixed(2)}</span>
+      </div>`;
+      
+      await sleep(speedMs);
+    }
+  }
+  
+  // After convolution, feature map is complete.
+  traceDiv.innerHTML += `<div class="calc-trace-row" style="color:var(--accent3)">✔ Convolution done. Output: ${oh}×${ow}</div>`;
+  
+  // ---------- Step 2: Pooling (2×2 window, stride 2) ----------
+  if (oh < 2 || ow < 2) {
+    traceDiv.innerHTML += `<div class="calc-trace-row" style="color:var(--warning)">⚠ Output too small for pooling (${oh}×${ow}) – skipping.</div>`;
+  } else {
+    const poolH = Math.floor(oh / 2);
+    const poolW = Math.floor(ow / 2);
+    const pooled = Array.from({length: poolH}, () => new Float32Array(poolW));
+    
+    const pCanvas = document.getElementById('pipelinePoolCanvas');
+    const pCtx = pCanvas.getContext('2d');
+    const pCellW = pCanvas.width / poolW;
+    const pCellH = pCanvas.height / poolH;
+    pCtx.fillStyle = '#1e1e2e';
+    pCtx.fillRect(0,0,pCanvas.width,pCanvas.height);
+    
+    for (let pr = 0; pr < poolH; pr++) {
+      for (let pc = 0; pc < poolW; pc++) {
+        if (pipelineAnimAbort) { pipelineAnimRunning = false; return; }
+        const vals = [];
+        for (let r = 0; r < 2; r++) {
+          for (let c = 0; c < 2; c++) {
+            vals.push(featureMap[pr*2+r][pc*2+c]);
+          }
+        }
+        const poolVal = poolType === 'max' ? Math.max(...vals) : Math.min(...vals);
+        pooled[pr][pc] = poolVal;
+        
+        // color
+        const t = Math.max(0, Math.min(1, (poolVal + 10) / 20));
+        const [rr, gg, bb] = heatColor(t);
+        pCtx.fillStyle = `rgb(${rr},${gg},${bb})`;
+        pCtx.fillRect(pc * pCellW, pr * pCellH, pCellW, pCellH);
+        
+        traceDiv.innerHTML = `<div class="calc-trace-row">
+          <span class="calc-trace-idx">[${pr}][${pc}]</span>
+          <span class="calc-trace-expr">${poolType}(${vals.map(v=>v.toFixed(2)).join(', ')})</span>
+          <span class="calc-trace-val">= ${poolVal.toFixed(2)}</span>
+        </div>`;
+        await sleep(speedMs);
+      }
+    }
+    traceDiv.innerHTML += `<div class="calc-trace-row" style="color:var(--accent3)">✔ Pooling done. Output: ${poolH}×${poolW}</div>`;
+    
+    // ---------- Step 3: Flatten ----------
+    const flatVec = [];
+    for (let r = 0; r < poolH; r++)
+      for (let c = 0; c < poolW; c++)
+        flatVec.push(pooled[r][c]);
+    
+    const flatCanvas = document.getElementById('pipelineFlattenCanvas');
+    drawVectorStrip(flatCanvas, flatVec, 24);
+    traceDiv.innerHTML += `<div class="calc-trace-row" style="color:var(--accent3)">✔ Flattened vector: ${flatVec.map(v=>v.toFixed(2)).join(', ')}</div>`;
+    await sleep(speedMs);
+    
+    // ---------- Step 4: Dense layer (2 neurons) ----------
+    // Fixed toy weights (2×4) and biases, based on a seed from the flatVec for reproducibility
+    const seed = flatVec.reduce((a,b) => a+b, 0);
+    const nNeurons = 2;
+    const nInputs = flatVec.length;
+    const W = Array.from({length: nNeurons}, (_, i) =>
+      Array.from({length: nInputs}, (_, j) =>
+        parseFloat((Math.sin(seed*(i+1)*(j+1)*0.37)*0.8).toFixed(2))
+      )
+    );
+    const b = Array.from({length: nNeurons}, (_, i) =>
+      parseFloat((Math.cos(seed*(i+1)*0.51)*0.2).toFixed(2))
+    );
+    const denseOut = W.map((wRow, i) => {
+      const dot = wRow.reduce((s, w, j) => s + w * flatVec[j], b[i]);
+      return Math.max(0, parseFloat(dot.toFixed(2))); // ReLU
+    });
+    
+    // Show weight matrix and result
+    const denseDiv = document.getElementById('pipelineDenseOutput');
+    denseDiv.innerHTML = '';
+    denseDiv.style.gridTemplateColumns = `repeat(2, 44px)`;
+    denseOut.forEach(v => {
+      const cell = document.createElement('div');
+      cell.className = 'num-cell';
+      const t = Math.max(0, Math.min(1, v / (Math.max(...denseOut)+1e-6)));
+      const [rr, gg, bb] = heatColor(t);
+      cell.style.background = `rgba(${rr},${gg},${bb},0.35)`;
+      cell.textContent = v.toFixed(2);
+      denseDiv.appendChild(cell);
+    });
+    
+    traceDiv.innerHTML += `<div class="calc-trace-row" style="color:var(--accent3)">
+      <span class="calc-trace-idx">Dense</span>
+      <span class="calc-trace-expr">y = ReLU(W·x + b)</span>
+      <span class="calc-trace-val">[${denseOut.join(', ')}]</span>
+    </div>`;
+  } // end of pooling step
+  pipelineAnimRunning = false;
+  document.getElementById('btnPlayPipeline').disabled = false;
+}
+
+/* ================================================================
    DATASET GENERATION
    ================================================================ */
 const IMG_SIZE    = 28;
@@ -1830,6 +2123,7 @@ async function init() {
   initActivationDemo();
   initPoolDemo();
   initFlatDemo();
+  initFullPipelineDemo();
   updateLoader('Generating training dataset…');
   await generateDataset();
   updateLoader('Generating computation walkthrough…');
